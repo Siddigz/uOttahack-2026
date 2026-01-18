@@ -3,9 +3,10 @@ import sys
 import time
 import random
 import re
+import math
 from collections import deque
 from openpyxl import load_workbook
-from routing import Label, Ship, pareto_optimal_path, reconstruct_path
+from routing import Label, Ship, pareto_optimal_path, reconstruct_path, prune_path
 
 # Initialize Pygame
 pygame.init()
@@ -33,6 +34,10 @@ LIGHT_GRAY = (240, 240, 240)
 GREEN = (50, 200, 50)
 DARK_GREEN = (30, 150, 30)
 RED = (255, 0, 0)
+ORANGE = (255, 165, 0)
+
+# Global grid cache to avoid redundant analysis
+_cached_grid = None
 
 # Load background image
 try:
@@ -57,6 +62,9 @@ try:
 except pygame.error as e:
     print(f"Couldn't load arctic map image: {e}")
     arctic_map_img = None
+
+# Grid spacing constant
+GRID_SPACING = 25
 
 # GridCell class to store base properties of a grid square
 class GridCell:
@@ -90,7 +98,7 @@ def is_blue_surface(x, y):
     except:
         return False
 
-def analyze_cell_from_image(cell_x, cell_y, grid_spacing):
+def analyze_cell_from_image(cell_x, cell_y, grid_spacing, pixel_array=None):
     """
     Analyze image pixels in a grid cell to determine its properties.
     Returns a GridCell instance.
@@ -103,6 +111,9 @@ def analyze_cell_from_image(cell_x, cell_y, grid_spacing):
     total_samples = 0
     total_brightness = 0
     
+    # Use PixelArray if provided for much faster access
+    use_pixel_array = pixel_array is not None
+    
     for i in range(5):
         for j in range(5):
             px = cell_x + (i + 1) * (grid_spacing // 6)
@@ -110,12 +121,18 @@ def analyze_cell_from_image(cell_x, cell_y, grid_spacing):
             
             if 0 <= px < width and 0 <= py < height:
                 try:
-                    # Use standard blue detection
-                    if is_blue_surface(px, py):
+                    if use_pixel_array:
+                        raw_color = pixel_array[px, py]
+                        # Use surface.unmap_rgb for safe cross-platform RGB extraction
+                        r, g, b = arctic_map_img.unmap_rgb(raw_color)[:3]
+                    else:
+                        color = arctic_map_img.get_at((px, py))
+                        r, g, b, _ = color
+                    
+                    # Blue detection: b > r + 15 and b > g + 15 and b > 100
+                    if b > r + 15 and b > g + 15 and b > 100:
                         blue_pixels += 1
                     
-                    color = arctic_map_img.get_at((px, py))
-                    r, g, b, a = color
                     total_brightness += (r + g + b) / 3
                     total_samples += 1
                 except:
@@ -128,17 +145,17 @@ def analyze_cell_from_image(cell_x, cell_y, grid_spacing):
     ice_ratio = 1.0 - water_ratio
     avg_brightness = total_brightness / total_samples
     
-    # Risk: base risk from ice, plus brightness bonus for thick ice
-    risk = ice_ratio * 7.0 + (avg_brightness / 255.0) * 3.0
+    # Risk: base risk from ice, plus brightness bonus for thick ice, plus significant independent randomness
+    risk = ice_ratio * 5.0 + (avg_brightness / 255.0) * 2.0 + random.uniform(0, 10.0)
     
-    # Time multiplier: 1.0 for water, up to 10.0 for dense ice
-    time_mult = 1.0 + ice_ratio * 9.0
+    # Time multiplier: base ice delay plus significant independent randomness
+    time_mult = 1.0 + ice_ratio * 5.0 + random.uniform(0, 10.0)
     
-    # Fuel multiplier: 1.0 for water, up to 5.0 for dense ice
-    fuel_mult = 1.0 + ice_ratio * 4.0
+    # Fuel multiplier: base ice drag plus significant independent randomness
+    fuel_mult = 1.0 + ice_ratio * 3.0 + random.uniform(0, 7.0)
     
-    # Weather: simulated for now as a combination of ice and randomness
-    weather = 1.0 + ice_ratio * 2.0 + random.uniform(0, 2.0)
+    # Weather: simulated as a combination of ice and randomness
+    weather = 1.0 + ice_ratio * 2.0 + random.uniform(0, 5.0)
     
     # Determine if clickable: show grid if ANY sampled point is water
     # This helps catch narrow rivers and small bodies of water
@@ -149,20 +166,32 @@ def analyze_cell_from_image(cell_x, cell_y, grid_spacing):
 def init_grid_cells(width, height, grid_spacing):
     """
     Initialize grid cells and perform reachability check from top-left.
+    Uses PixelArray for performance and caches the result.
     """
+    global _cached_grid
+    if _cached_grid is not None:
+        return _cached_grid
+
     grid_cols = (width + grid_spacing - 1) // grid_spacing
     grid_rows = (height + grid_spacing - 1) // grid_spacing
     grid = []
     
-    # 1. Initial analysis
-    for row in range(grid_rows):
-        grid_row = []
-        for col in range(grid_cols):
-            cell_x = col * grid_spacing
-            cell_y = row * grid_spacing
-            cell_data = analyze_cell_from_image(cell_x, cell_y, grid_spacing)
-            grid_row.append(cell_data)
-        grid.append(grid_row)
+    # Use PixelArray to lock the surface for high-speed access
+    pixel_array = pygame.PixelArray(arctic_map_img)
+    
+    try:
+        # 1. Initial analysis
+        for row in range(grid_rows):
+            grid_row = []
+            for col in range(grid_cols):
+                cell_x = col * grid_spacing
+                cell_y = row * grid_spacing
+                cell_data = analyze_cell_from_image(cell_x, cell_y, grid_spacing, pixel_array)
+                grid_row.append(cell_data)
+            grid.append(grid_row)
+    finally:
+        # Unlock the surface
+        pixel_array.close()
         
     # 2. Find starting point (first clickable cell from top-left)
     start_node = None
@@ -175,6 +204,7 @@ def init_grid_cells(width, height, grid_spacing):
             break
             
     if not start_node:
+        _cached_grid = grid
         return grid
 
     # 3. BFS Reachability Check
@@ -198,24 +228,105 @@ def init_grid_cells(width, height, grid_spacing):
             if (r, c) not in reachable:
                 grid[r][c].is_clickable = False
                 
+    _cached_grid = grid
     return grid
 
-def get_value_color(value, min_val, max_val):
+def get_spline_points(path, num_segments=15):
     """
-    Calculate a color from Green (min) to Red (max).
-    Lower values are considered 'better' (Greener).
+    Generate Catmull-Rom spline points for a given path to make it look smooth.
     """
-    if max_val == min_val:
-        return (0, 255, 0)
+    if len(path) < 2:
+        return path
     
-    # Normalize value between 0 and 1
-    t = max(0, min(1, (value - min_val) / (max_val - min_val)))
+    # Duplicate start and end points to handle Catmull-Rom boundaries
+    points = [path[0]] + path + [path[-1]]
     
-    # Interpolate between Green (0, 255, 0) and Red (255, 0, 0)
-    r = int(255 * t)
-    g = int(255 * (1 - t))
-    b = 0
-    return (r, g, b)
+    spline_path = []
+    for i in range(1, len(points) - 2):
+        p0 = points[i-1]
+        p1 = points[i]
+        p2 = points[i+1]
+        p3 = points[i+2]
+        
+        for t_int in range(num_segments):
+            t = t_int / num_segments
+            t2 = t * t
+            t3 = t2 * t
+            
+            # Catmull-Rom interpolation formula
+            x = 0.5 * (
+                (2 * p1[0]) +
+                (-p0[0] + p2[0]) * t +
+                (2 * p0[0] - 5 * p1[0] + 4 * p2[0] - p3[0]) * t2 +
+                (-p0[0] + 3 * p1[0] - 3 * p2[0] + p3[0]) * t3
+            )
+            y = 0.5 * (
+                (2 * p1[1]) +
+                (-p0[1] + p2[1]) * t +
+                (2 * p0[1] - 5 * p1[1] + 4 * p2[1] - p3[1]) * t2 +
+                (-p0[1] + 3 * p1[1] - 3 * p2[1] + p3[1]) * t3
+            )
+            spline_path.append((x, y))
+            
+    # Add the final point
+    spline_path.append(path[-1])
+    return spline_path
+
+def get_final_path_points(label, grid_cells, point_a, point_b, goal_node, grid_spacing):
+    """
+    Process a Pareto label into a final list of screen coordinates.
+    Handles reconstruction, pruning, coordinate conversion, and spline validation.
+    """
+    if not label:
+        return None
+        
+    # 1. Reconstruct initial grid path: list of (r, c)
+    raw_path_indices = reconstruct_path(label)
+    raw_path_indices.append(goal_node)
+    
+    # 2. Prune the path to get direct any-angle lines (String Pulling)
+    pruned_indices = prune_path(grid_cells, raw_path_indices)
+    
+    # 3. Convert grid indices to screen coordinates
+    waypoint_coords = []
+    # Start directly from point_a (no hook to cell center)
+    waypoint_coords.append(point_a)
+    
+    # Convert intermediate waypoints to centers
+    for r, c in pruned_indices:
+        px = c * grid_spacing + grid_spacing // 2
+        py = r * grid_spacing + grid_spacing // 2
+        
+        # Avoid adding point if it's too close to point_a or point_b
+        dist_a = math.sqrt((px - point_a[0])**2 + (py - point_a[1])**2)
+        dist_b = math.sqrt((px - point_b[0])**2 + (py - point_b[1])**2)
+        
+        if dist_a > grid_spacing // 2 and dist_b > grid_spacing // 2:
+            waypoint_coords.append((px, py))
+    
+    # End directly at point_b
+    waypoint_coords.append(point_b)
+    
+    # 4. Apply Catmull-Rom Spline smoothing for a natural curve
+    raw_spline_path = get_spline_points(waypoint_coords, num_segments=15)
+    
+    # 5. Final Validation: Ensure smoothed points don't drift onto land
+    # Optimization: Sample only 1 out of every 3 spline points for validation
+    is_path_valid = True
+    for i in range(0, len(raw_spline_path), 3):
+        px, py = raw_spline_path[i]
+        if not is_blue_surface(int(px), int(py)):
+            is_path_valid = False
+            break
+    
+    if is_path_valid and not is_blue_surface(int(raw_spline_path[-1][0]), int(raw_spline_path[-1][1])):
+        is_path_valid = False
+    
+    if is_path_valid:
+        return raw_spline_path
+    else:
+        # Fallback to pruned waypoints if spline drifts
+        return waypoint_coords
 
 # Load ships data from Excel
 def load_ships_data():
@@ -261,17 +372,17 @@ def load_ships_data():
                 # Convert to a Ship object for the routing algorithm if all required fields are present
                 try:
                     # Clean the data (remove units if present, etc.)
-                    def clean_val(val):
-                        if not val: return 0.0
+                    def clean_val(val, default=0.0):
+                        if not val: return default
                         # Extract first number found in string
                         match = re.search(r"[-+]?\d*\.\d+|\d+", str(val))
-                        return float(match.group()) if match else 0.0
+                        return float(match.group()) if match else default
 
                     # Store the original data for display and the Ship object for logic
                     ship_data['obj'] = Ship(
-                        base_speed=clean_val(ship_data.get('Speed', '0')),
-                        base_fuel_rate=clean_val(ship_data.get('Fuel Consumption', '0')),
-                        durability=clean_val(ship_data.get('Durability', '0'))
+                        base_speed=clean_val(ship_data.get('Speed', '0'), default=1.0),
+                        base_fuel_rate=clean_val(ship_data.get('Fuel Consumption', '0'), default=1.0),
+                        durability=clean_val(ship_data.get('Durability', '0'), default=1.0)
                     )
                 except Exception as e:
                     print(f"Warning: Could not create Ship object for {ship_data.get('Ship name', 'unknown')}: {e}")
@@ -296,7 +407,26 @@ point_b = None  # Store point B position
 points_confirmed = False  # Track if points A and B have been confirmed
 toggle_on = False  # Toggle button state
 grid_cells = None  # 2D grid of GridCell instances for each grid square
-calculated_path = None  # List of grid indices for the fastest route
+available_paths = {'time': None, 'fuel': None, 'risk': None}  # Dictionary to store optimized paths
+selected_path_type = 'time'  # Currently selected path type
+selected_grid_layer = 'none'  # Grid visualization layer: 'none', 'risk', 'time', 'fuel'
+
+def get_value_color(value, min_val, max_val):
+    """
+    Calculate a color from Green (min) to Red (max).
+    Returns (r, g, b, alpha)
+    """
+    if max_val == min_val:
+        return (0, 255, 0, 128)
+    
+    # Normalize value between 0 and 1
+    t = max(0, min(1, (value - min_val) / (max_val - min_val)))
+    
+    # Interpolate between Green (0, 255, 0) and Red (255, 0, 0)
+    r = int(255 * t)
+    g = int(255 * (1 - t))
+    b = 0
+    return (r, g, b, 128)
 
 # Font setup
 font_large = pygame.font.Font(None, 36)
@@ -423,7 +553,10 @@ while running:
                 point_b = None
                 points_confirmed = False
                 toggle_on = False
+                selected_grid_layer = 'none'
                 grid_cells = None
+                available_paths = {'time': None, 'fuel': None, 'risk': None}
+                selected_path_type = 'time'
         elif event.type == pygame.MOUSEBUTTONDOWN:
             mouse_x, mouse_y = event.pos
             
@@ -447,7 +580,7 @@ while running:
                             current_page = 2
                             page2_start_time = time.time()  # Record when page 2 starts
                             # Initialize grid cells when entering page 2
-                            grid_cells = init_grid_cells(width, height, 50)
+                            grid_cells = init_grid_cells(width, height, GRID_SPACING)
                             continue
                     
                     # Check if clicking on a ship button
@@ -467,44 +600,96 @@ while running:
             
             elif current_page == 2:  # Page 2: Map clicking
                 if event.button == 1:  # Left click
-                    # Check if clicking on toggle button (top right)
+                    # 1. UI Buttons First
+                    # Toggle Grid button
                     toggle_button_width = 130
                     toggle_button_height = 30
                     toggle_button_x = width - toggle_button_width - 10
                     toggle_button_y = 10
                     toggle_button_rect = pygame.Rect(toggle_button_x, toggle_button_y, toggle_button_width, toggle_button_height)
                     
+                    # Grid Layer buttons
+                    layer_btn_w = 130
+                    layer_btn_h = 30
+                    layer_btn_x = width - layer_btn_w - 10
+                    time_rect = pygame.Rect(layer_btn_x, 50, layer_btn_w, layer_btn_h)
+                    fuel_rect = pygame.Rect(layer_btn_x, 90, layer_btn_w, layer_btn_h)
+                    risk_rect = pygame.Rect(layer_btn_x, 130, layer_btn_w, layer_btn_h)
+                    
+                    # Route selection buttons (bottom left)
+                    route_btn_w = 200
+                    route_btn_h = 45
+                    route_btn_x = 10
+                    route_btn_y_start = height - (route_btn_h + 10) * 3 - 10
+                    fastest_rect = pygame.Rect(route_btn_x, route_btn_y_start, route_btn_w, route_btn_h)
+                    eco_rect = pygame.Rect(route_btn_x, route_btn_y_start + route_btn_h + 10, route_btn_w, route_btn_h)
+                    safest_rect = pygame.Rect(route_btn_x, route_btn_y_start + (route_btn_h + 10) * 2, route_btn_w, route_btn_h)
+                    
+                    # Map Confirm button
+                    confirm_btn_w = 150
+                    confirm_btn_h = 40
+                    confirm_btn_x = 10
+                    confirm_btn_y = height - confirm_btn_h - 10
+                    map_confirm_rect = pygame.Rect(confirm_btn_x, confirm_btn_y, confirm_btn_w, confirm_btn_h)
+
+                    # Handle Clicks
                     if toggle_button_rect.collidepoint(mouse_x, mouse_y):
-                        # Toggle the state
                         toggle_on = not toggle_on
-                        # Initialize grid cells if they don't exist and toggle is being turned on
                         if toggle_on and grid_cells is None:
-                            grid_cells = init_grid_cells(width, height, 50)
-                    elif not points_confirmed:  # Only allow point changes if not confirmed
-                        # Check if clicking on confirm button
-                        if point_a and point_b:
-                            button_width = 150
-                            button_height = 40
-                            button_x = 10
-                            button_y = height - button_height - 10
-                            confirm_button_rect = pygame.Rect(button_x, button_y, button_width, button_height)
+                            grid_cells = init_grid_cells(width, height, GRID_SPACING)
+                        if not toggle_on:
+                            selected_grid_layer = 'none'
+                    elif toggle_on and time_rect.collidepoint(mouse_x, mouse_y):
+                        selected_grid_layer = 'time' if selected_grid_layer != 'time' else 'none'
+                    elif toggle_on and fuel_rect.collidepoint(mouse_x, mouse_y):
+                        selected_grid_layer = 'fuel' if selected_grid_layer != 'fuel' else 'none'
+                    elif toggle_on and risk_rect.collidepoint(mouse_x, mouse_y):
+                        selected_grid_layer = 'risk' if selected_grid_layer != 'risk' else 'none'
+                    elif points_confirmed and any(available_paths.values()):
+                        if fastest_rect.collidepoint(mouse_x, mouse_y):
+                            selected_path_type = 'time'
+                        elif eco_rect.collidepoint(mouse_x, mouse_y):
+                            selected_path_type = 'fuel'
+                        elif safest_rect.collidepoint(mouse_x, mouse_y):
+                            selected_path_type = 'risk'
+                    elif not points_confirmed:
+                        if point_a and point_b and map_confirm_rect.collidepoint(mouse_x, mouse_y):
+                            # Visual feedback for processing
+                            overlay = pygame.Surface((width, height))
+                            overlay.set_alpha(128)
+                            overlay.fill(BLACK)
+                            screen.blit(overlay, (0, 0))
+                            proc_text = font_large.render("Processing Path...", True, WHITE)
+                            proc_rect = proc_text.get_rect(center=(width // 2, height // 2))
+                            screen.blit(proc_text, proc_rect)
+                            pygame.display.flip()
                             
-                            if confirm_button_rect.collidepoint(mouse_x, mouse_y):
-                                # Confirm the points
-                                points_confirmed = True
-                            else:
-                                # Set point A on map click only if on blue surface
-                                if is_blue_surface(mouse_x, mouse_y):
-                                    point_a = (mouse_x, mouse_y)
-                        else:
-                            # Set point A on map click only if on blue surface
-                            if is_blue_surface(mouse_x, mouse_y):
-                                point_a = (mouse_x, mouse_y)
+                            points_confirmed = True
+                            if grid_cells:
+                                grid_spacing = GRID_SPACING
+                                start_node = (point_a[1] // grid_spacing, point_a[0] // grid_spacing)
+                                goal_node = (point_b[1] // grid_spacing, point_b[0] // grid_spacing)
+                                start_node = (max(0, min(len(grid_cells)-1, start_node[0])), max(0, min(len(grid_cells[0])-1, start_node[1])))
+                                goal_node = (max(0, min(len(grid_cells)-1, goal_node[0])), max(0, min(len(grid_cells[0])-1, goal_node[1])))
+                                pareto_labels = pareto_optimal_path(grid_cells, start_node, goal_node, confirmed_ship['obj'])
+                                if pareto_labels:
+                                    time_label = min(pareto_labels, key=lambda l: l.time)
+                                    fuel_label = min(pareto_labels, key=lambda l: l.fuel)
+                                    risk_label = min(pareto_labels, key=lambda l: l.risk)
+                                    available_paths['time'] = {'points': get_final_path_points(time_label, grid_cells, point_a, point_b, goal_node, grid_spacing), 'time': time_label.time, 'fuel': time_label.fuel, 'risk': time_label.risk}
+                                    available_paths['fuel'] = {'points': get_final_path_points(fuel_label, grid_cells, point_a, point_b, goal_node, grid_spacing), 'time': fuel_label.time, 'fuel': fuel_label.fuel, 'risk': fuel_label.risk}
+                                    available_paths['risk'] = {'points': get_final_path_points(risk_label, grid_cells, point_a, point_b, goal_node, grid_spacing), 'time': risk_label.time, 'fuel': risk_label.fuel, 'risk': risk_label.risk}
+                                    selected_path_type = 'time'
+                                else:
+                                    available_paths = {'time': None, 'fuel': None, 'risk': None}
+                        elif is_blue_surface(mouse_x, mouse_y):
+                            point_a = (mouse_x, mouse_y)
+                            available_paths = {'time': None, 'fuel': None, 'risk': None}
                 elif event.button == 3:  # Right click - point B
-                    if not points_confirmed:  # Only allow point changes if not confirmed
-                        # Set point B on map click only if on blue surface
+                    if not points_confirmed:
                         if is_blue_surface(mouse_x, mouse_y):
                             point_b = (mouse_x, mouse_y)
+                            available_paths = {'time': None, 'fuel': None, 'risk': None}
 
     # Draw background
     if current_page == 1:
@@ -652,7 +837,7 @@ while running:
     elif current_page == 2:
         # Draw grid first (if toggle is on) so UI elements appear on top
         if toggle_on:
-            grid_spacing = 50  # Grid cell size
+            grid_spacing = GRID_SPACING  # Grid cell size
             grid_color = (200, 200, 200, 128)  # Semi-transparent gray
             
             # Initialize grid cells if they don't exist
@@ -675,33 +860,34 @@ while running:
                             
                             # Draw cell boundary
                             cell_rect = pygame.Rect(cell_x, cell_y, grid_spacing, grid_spacing)
+                            
+                            # Fill cell if a layer is selected
+                            if selected_grid_layer != 'none':
+                                if selected_grid_layer == 'risk':
+                                    color = get_value_color(cell_data.risk, 0.0, 15.0)
+                                elif selected_grid_layer == 'time':
+                                    color = get_value_color(cell_data.time, 1.0, 15.0)
+                                elif selected_grid_layer == 'fuel':
+                                    color = get_value_color(cell_data.fuel, 1.0, 10.0)
+                                
+                                # Draw filled rect with alpha using a temporary surface
+                                s = pygame.Surface((grid_spacing, grid_spacing), pygame.SRCALPHA)
+                                s.fill(color)
+                                screen.blit(s, (cell_x, cell_y))
+                                
                             pygame.draw.rect(screen, grid_color[:3], cell_rect, 1)
-                            
-                            # Format the values to 1 decimal place
-                            risk_str = f"R:{cell_data.risk:.1f}"
-                            time_str = f"T:{cell_data.time:.1f}"
-                            fuel_str = f"F:{cell_data.fuel:.1f}"
-                            
-                            # Draw each value on a separate line with dynamic color
-                            # Define ranges for coloring: lower is better (Greener)
-                            risk_color = get_value_color(cell_data.risk, 0.0, 10.0)
-                            time_color = get_value_color(cell_data.time, 1.0, 10.0)
-                            fuel_color = get_value_color(cell_data.fuel, 1.0, 5.0)
-                            
-                            y_offset = 3
-                            # Risk
-                            risk_text = font_cell.render(risk_str, True, risk_color)
-                            screen.blit(risk_text, (cell_x + 2, cell_y + y_offset))
-                            y_offset += 14
-                            
-                            # Time
-                            time_text = font_cell.render(time_str, True, time_color)
-                            screen.blit(time_text, (cell_x + 2, cell_y + y_offset))
-                            y_offset += 14
-                            
-                            # Fuel
-                            fuel_text = font_cell.render(fuel_str, True, fuel_color)
-                            screen.blit(fuel_text, (cell_x + 2, cell_y + y_offset))
+        
+        # Draw the calculated path if it exists
+        path_data = available_paths.get(selected_path_type)
+        if path_data and path_data['points']:
+            path_points = path_data['points']
+            # Color map for the paths
+            path_colors = {'time': GREEN, 'fuel': BLUE, 'risk': ORANGE}
+            color = path_colors.get(selected_path_type, BLUE)
+            
+            # Draw a thick line connecting the path points
+            if len(path_points) > 1:
+                pygame.draw.lines(screen, color, False, path_points, 5)
         
         # Display ship name in top left (drawn on top of grid)
         if confirmed_ship:
@@ -727,6 +913,33 @@ while running:
         toggle_text = font_small.render("Show Grid", True, BLACK)
         text_rect = toggle_text.get_rect(center=toggle_button_rect.center)
         screen.blit(toggle_text, text_rect)
+        
+        # Draw layer selection buttons if grid is on
+        if toggle_on:
+            layer_btn_w = 130
+            layer_btn_h = 30
+            layer_btn_x = width - layer_btn_w - 10
+            
+            layers = [
+                ("Time Layer", 'time', GREEN),
+                ("Fuel Layer", 'fuel', BLUE),
+                ("Risk Layer", 'risk', ORANGE)
+            ]
+            
+            for i, (label, l_type, color) in enumerate(layers):
+                btn_y = 50 + i * 40
+                rect = pygame.Rect(layer_btn_x, btn_y, layer_btn_w, layer_btn_h)
+                
+                # Background
+                bg_color = color if selected_grid_layer == l_type else LIGHT_GRAY
+                pygame.draw.rect(screen, bg_color, rect)
+                pygame.draw.rect(screen, BLACK, rect, 2)
+                
+                # Text
+                txt_color = WHITE if selected_grid_layer == l_type else BLACK
+                txt_surf = font_small.render(label, True, txt_color)
+                txt_rect = txt_surf.get_rect(center=rect.center)
+                screen.blit(txt_surf, txt_rect)
         
         # Display prompt for 3 seconds
         if page2_start_time is not None:
@@ -781,6 +994,49 @@ while running:
             confirm_text = font_medium.render("Confirm", True, WHITE)
             text_rect = confirm_text.get_rect(center=confirm_button_rect.center)
             screen.blit(confirm_text, text_rect)
+            
+        # Draw path selection buttons if points are confirmed
+        if points_confirmed and any(available_paths.values()):
+            button_width = 200
+            button_height = 45
+            button_x = 10
+            button_y_start = height - (button_height + 10) * 3 - 10
+            
+            # Paths labels and types
+            paths = [
+                ("Fastest", 'time', GREEN),
+                ("Eco-Friendly", 'fuel', BLUE),
+                ("Safest", 'risk', ORANGE)
+            ]
+            
+            for i, (label, p_type, color) in enumerate(paths):
+                rect = pygame.Rect(button_x, button_y_start + i * (button_height + 10), button_width, button_height)
+                
+                # Highlight if selected
+                if selected_path_type == p_type:
+                    pygame.draw.rect(screen, color, rect)
+                    text_color = WHITE
+                else:
+                    pygame.draw.rect(screen, LIGHT_GRAY, rect)
+                    text_color = BLACK
+                
+                pygame.draw.rect(screen, BLACK, rect, 2)
+                
+                # Draw label and metrics
+                path_data = available_paths.get(p_type)
+                if path_data:
+                    if p_type == 'time':
+                        metric_text = f"{label}: {path_data['time']:.1f}h"
+                    elif p_type == 'fuel':
+                        metric_text = f"{label}: {path_data['fuel']:.1f}L"
+                    else:
+                        metric_text = f"{label}: {path_data['risk']:.1f}R"
+                else:
+                    metric_text = label
+                    
+                text_surf = font_medium.render(metric_text, True, text_color)
+                text_rect = text_surf.get_rect(center=rect.center)
+                screen.blit(text_surf, text_rect)
 
     # Update the display
     pygame.display.flip()
