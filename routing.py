@@ -22,6 +22,13 @@ class Label:
         return (self.risk, self.time, self.fuel) < (other.risk, other.time, other.fuel)
 
 
+class Ship:
+    def __init__(self, base_speed, base_fuel_rate, durability):
+        self.base_speed = base_speed
+        self.base_fuel_rate = base_fuel_rate
+        self.durability = durability
+
+
 def dominates(a, b):
     """
     Label A dominates Label B if:
@@ -75,7 +82,9 @@ def pareto_optimal_path(
     """
     grid[r][c] must have:
         - grid[r][c].risk     (base risk, e.g. 1–10)
-        - grid[r][c].current  (environmental current strength)
+        - grid[r][c].time     (time weight/multiplier for the cell)
+        - grid[r][c].fuel     (fuel consumption multiplier for the cell)
+        - grid[r][c].weather  (environmental/weather factor)
 
     ship must have:
         - ship.base_speed
@@ -118,25 +127,26 @@ def pareto_optimal_path(
 
             cell = grid[nb[0]][nb[1]]
 
-            base_risk = cell.risk
-            current_strength = cell.current
-
             # ----------------------------
             # COST COMPUTATION
             # ----------------------------
 
+            # Risk: additive, influenced by weather and durability
             effective_risk = (
-                base_risk
-                + alpha * current_strength / ship.durability
+                cell.risk
+                + alpha * cell.weather / ship.durability
             )
             effective_risk = max(0.0, effective_risk)
 
+            # Fuel: cell multiplier * base rate, influenced by weather and durability
             fuel_cost = (
-                ship.base_fuel_rate * d
-                * (1 + gamma * current_strength / ship.durability)
+                (ship.base_fuel_rate * cell.fuel)
+                * (1 + gamma * cell.weather / ship.durability)
+                * d
             )
 
-            time_cost = d / ship.base_speed
+            # Time: cell time weight / ship speed
+            time_cost = (cell.time * d) / ship.base_speed
 
             new_label = Label(
                 risk=current_label.risk + effective_risk,

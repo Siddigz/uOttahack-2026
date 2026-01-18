@@ -1,8 +1,11 @@
 import pygame
 import sys
 import time
+import random
+import re
+from collections import deque
 from openpyxl import load_workbook
-from routing import Label
+from routing import Label, Ship, pareto_optimal_path, reconstruct_path
 
 # Initialize Pygame
 pygame.init()
@@ -55,6 +58,15 @@ except pygame.error as e:
     print(f"Couldn't load arctic map image: {e}")
     arctic_map_img = None
 
+# GridCell class to store base properties of a grid square
+class GridCell:
+    def __init__(self, risk=0.0, time=1.0, fuel=1.0, weather=1.0, is_clickable=False):
+        self.risk = risk
+        self.time = time
+        self.fuel = fuel
+        self.weather = weather
+        self.is_clickable = is_clickable
+
 # Function to check if a point is on blue (water) surface
 def is_blue_surface(x, y):
     """Check if the pixel at (x, y) is blue (water)"""
@@ -71,12 +83,139 @@ def is_blue_surface(x, y):
         r, g, b, a = pixel_color
         
         # Check if it's blue (blue channel is dominant)
-        # Blue water typically has: b > r and b > g, and b is relatively high
-        is_blue = b > r and b > g and b > 100
+        # Stricter margin to avoid gray (where r, g, b are almost equal)
+        is_blue = b > r + 15 and b > g + 15 and b > 100
         
         return is_blue
     except:
         return False
+
+def analyze_cell_from_image(cell_x, cell_y, grid_spacing):
+    """
+    Analyze image pixels in a grid cell to determine its properties.
+    Returns a GridCell instance.
+    """
+    if arctic_map_img is None:
+        return GridCell(risk=1.0, time=1.0, fuel=1.0, weather=1.0)
+    
+    # Sample pixels within the cell (5x5 grid)
+    blue_pixels = 0
+    total_samples = 0
+    total_brightness = 0
+    
+    for i in range(5):
+        for j in range(5):
+            px = cell_x + (i + 1) * (grid_spacing // 6)
+            py = cell_y + (j + 1) * (grid_spacing // 6)
+            
+            if 0 <= px < width and 0 <= py < height:
+                try:
+                    # Use standard blue detection
+                    if is_blue_surface(px, py):
+                        blue_pixels += 1
+                    
+                    color = arctic_map_img.get_at((px, py))
+                    r, g, b, a = color
+                    total_brightness += (r + g + b) / 3
+                    total_samples += 1
+                except:
+                    continue
+    
+    if total_samples == 0:
+        return GridCell(risk=5.0, time=3.0, fuel=2.0, weather=1.0, is_clickable=False)
+    
+    water_ratio = blue_pixels / total_samples
+    ice_ratio = 1.0 - water_ratio
+    avg_brightness = total_brightness / total_samples
+    
+    # Risk: base risk from ice, plus brightness bonus for thick ice
+    risk = ice_ratio * 7.0 + (avg_brightness / 255.0) * 3.0
+    
+    # Time multiplier: 1.0 for water, up to 10.0 for dense ice
+    time_mult = 1.0 + ice_ratio * 9.0
+    
+    # Fuel multiplier: 1.0 for water, up to 5.0 for dense ice
+    fuel_mult = 1.0 + ice_ratio * 4.0
+    
+    # Weather: simulated for now as a combination of ice and randomness
+    weather = 1.0 + ice_ratio * 2.0 + random.uniform(0, 2.0)
+    
+    # Determine if clickable: show grid if ANY sampled point is water
+    # This helps catch narrow rivers and small bodies of water
+    is_clickable = blue_pixels >= 1
+    
+    return GridCell(risk=risk, time=time_mult, fuel=fuel_mult, weather=weather, is_clickable=is_clickable)
+
+def init_grid_cells(width, height, grid_spacing):
+    """
+    Initialize grid cells and perform reachability check from top-left.
+    """
+    grid_cols = (width + grid_spacing - 1) // grid_spacing
+    grid_rows = (height + grid_spacing - 1) // grid_spacing
+    grid = []
+    
+    # 1. Initial analysis
+    for row in range(grid_rows):
+        grid_row = []
+        for col in range(grid_cols):
+            cell_x = col * grid_spacing
+            cell_y = row * grid_spacing
+            cell_data = analyze_cell_from_image(cell_x, cell_y, grid_spacing)
+            grid_row.append(cell_data)
+        grid.append(grid_row)
+        
+    # 2. Find starting point (first clickable cell from top-left)
+    start_node = None
+    for r in range(grid_rows):
+        for c in range(grid_cols):
+            if grid[r][c].is_clickable:
+                start_node = (r, c)
+                break
+        if start_node:
+            break
+            
+    if not start_node:
+        return grid
+
+    # 3. BFS Reachability Check
+    reachable = set()
+    queue = deque([start_node])
+    reachable.add(start_node)
+    
+    while queue:
+        r, c = queue.popleft()
+        # Neighbors: Up, Down, Left, Right
+        for dr, dc in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
+            nr, nc = r + dr, c + dc
+            if 0 <= nr < grid_rows and 0 <= nc < grid_cols:
+                if grid[nr][nc].is_clickable and (nr, nc) not in reachable:
+                    reachable.add((nr, nc))
+                    queue.append((nr, nc))
+                    
+    # 4. Filter non-reachable cells
+    for r in range(grid_rows):
+        for c in range(grid_cols):
+            if (r, c) not in reachable:
+                grid[r][c].is_clickable = False
+                
+    return grid
+
+def get_value_color(value, min_val, max_val):
+    """
+    Calculate a color from Green (min) to Red (max).
+    Lower values are considered 'better' (Greener).
+    """
+    if max_val == min_val:
+        return (0, 255, 0)
+    
+    # Normalize value between 0 and 1
+    t = max(0, min(1, (value - min_val) / (max_val - min_val)))
+    
+    # Interpolate between Green (0, 255, 0) and Red (255, 0, 0)
+    r = int(255 * t)
+    g = int(255 * (1 - t))
+    b = 0
+    return (r, g, b)
 
 # Load ships data from Excel
 def load_ships_data():
@@ -96,9 +235,12 @@ def load_ships_data():
             9: header_row[9].value.strip() if header_row[9].value else None   # Durability Rating
         }
         
-        # Read ship data (rows 2-6, which gives us 5 ships)
-        for row_idx in range(2, 7):  # Rows 2-6 (5 ships)
+        # Read ship data dynamically
+        for row_idx in range(2, ws.max_row + 1):  # Read all rows starting from row 2
             row = list(ws[row_idx])
+            if not row[0].value:  # Stop if ship type is missing (empty row)
+                continue
+                
             ship_data = {}
             
             # Map data to headers based on column indices
@@ -116,6 +258,24 @@ def load_ships_data():
                 ship_data[headers[9]] = str(row[9].value).strip()
             
             if ship_data:  # Only add if we have data
+                # Convert to a Ship object for the routing algorithm if all required fields are present
+                try:
+                    # Clean the data (remove units if present, etc.)
+                    def clean_val(val):
+                        if not val: return 0.0
+                        # Extract first number found in string
+                        match = re.search(r"[-+]?\d*\.\d+|\d+", str(val))
+                        return float(match.group()) if match else 0.0
+
+                    # Store the original data for display and the Ship object for logic
+                    ship_data['obj'] = Ship(
+                        base_speed=clean_val(ship_data.get('Speed', '0')),
+                        base_fuel_rate=clean_val(ship_data.get('Fuel Consumption', '0')),
+                        durability=clean_val(ship_data.get('Durability', '0'))
+                    )
+                except Exception as e:
+                    print(f"Warning: Could not create Ship object for {ship_data.get('Ship name', 'unknown')}: {e}")
+                
                 ships.append(ship_data)
     except Exception as e:
         print(f"Error loading ships data: {e}")
@@ -135,7 +295,8 @@ point_a = None  # Store point A position
 point_b = None  # Store point B position
 points_confirmed = False  # Track if points A and B have been confirmed
 toggle_on = False  # Toggle button state
-grid_cells = None  # 2D grid of Label instances for each grid square
+grid_cells = None  # 2D grid of GridCell instances for each grid square
+calculated_path = None  # List of grid indices for the fastest route
 
 # Font setup
 font_large = pygame.font.Font(None, 36)
@@ -286,18 +447,7 @@ while running:
                             current_page = 2
                             page2_start_time = time.time()  # Record when page 2 starts
                             # Initialize grid cells when entering page 2
-                            grid_spacing = 50
-                            grid_cols = (width + grid_spacing - 1) // grid_spacing
-                            grid_rows = (height + grid_spacing - 1) // grid_spacing
-                            grid_cells = []
-                            for row in range(grid_rows):
-                                grid_row = []
-                                for col in range(grid_cols):
-                                    # Initialize each cell as a Label with default values
-                                    # risk=0, time=0, fuel=0, predecessor=None
-                                    cell_label = Label(risk=0.0, time=0.0, fuel=0.0, predecessor=None)
-                                    grid_row.append(cell_label)
-                                grid_cells.append(grid_row)
+                            grid_cells = init_grid_cells(width, height, 50)
                             continue
                     
                     # Check if clicking on a ship button
@@ -329,17 +479,7 @@ while running:
                         toggle_on = not toggle_on
                         # Initialize grid cells if they don't exist and toggle is being turned on
                         if toggle_on and grid_cells is None:
-                            grid_spacing = 50
-                            grid_cols = (width + grid_spacing - 1) // grid_spacing
-                            grid_rows = (height + grid_spacing - 1) // grid_spacing
-                            grid_cells = []
-                            for row in range(grid_rows):
-                                grid_row = []
-                                for col in range(grid_cols):
-                                    # Initialize each cell as a Label with default values
-                                    cell_label = Label(risk=0.0, time=0.0, fuel=0.0, predecessor=None)
-                                    grid_row.append(cell_label)
-                                grid_cells.append(grid_row)
+                            grid_cells = init_grid_cells(width, height, 50)
                     elif not points_confirmed:  # Only allow point changes if not confirmed
                         # Check if clicking on confirm button
                         if point_a and point_b:
@@ -517,45 +657,51 @@ while running:
             
             # Initialize grid cells if they don't exist
             if grid_cells is None:
-                grid_cols = (width + grid_spacing - 1) // grid_spacing
-                grid_rows = (height + grid_spacing - 1) // grid_spacing
-                grid_cells = []
-                for row in range(grid_rows):
-                    grid_row = []
-                    for col in range(grid_cols):
-                        # Initialize each cell as a Label with default values
-                        cell_label = Label(risk=0.0, time=0.0, fuel=0.0, predecessor=None)
-                        grid_row.append(cell_label)
-                    grid_cells.append(grid_row)
+                grid_cells = init_grid_cells(width, height, grid_spacing)
             
-            # Draw vertical lines
-            for x in range(0, width, grid_spacing):
-                pygame.draw.line(screen, grid_color[:3], (x, 0), (x, height), 1)
-            
-            # Draw horizontal lines
-            for y in range(0, height, grid_spacing):
-                pygame.draw.line(screen, grid_color[:3], (0, y), (width, y), 1)
+            # Draw horizontal lines (removed continuous lines)
             
             # Display risk, time, and fuel values in each cell
             if grid_cells is not None:
                 font_cell = pygame.font.Font(None, 16)  # Font for cell values
                 for row in range(len(grid_cells)):
                     for col in range(len(grid_cells[row])):
-                        cell_label = grid_cells[row][col]
-                        cell_x = col * grid_spacing
-                        cell_y = row * grid_spacing
+                        cell_data = grid_cells[row][col]
                         
-                        # Format the values to 2 decimal places
-                        risk_str = f"R:{cell_label.risk:.2f}"
-                        time_str = f"T:{cell_label.time:.2f}"
-                        fuel_str = f"F:{cell_label.fuel:.2f}"
-                        
-                        # Draw each value on a separate line
-                        y_offset = 3
-                        for text in [risk_str, time_str, fuel_str]:
-                            text_surface = font_cell.render(text, True, BLACK)
-                            screen.blit(text_surface, (cell_x + 2, cell_y + y_offset))
-                            y_offset += 14  # Line spacing
+                        # Only draw grid and numbers for clickable cells
+                        if cell_data.is_clickable:
+                            cell_x = col * grid_spacing
+                            cell_y = row * grid_spacing
+                            
+                            # Draw cell boundary
+                            cell_rect = pygame.Rect(cell_x, cell_y, grid_spacing, grid_spacing)
+                            pygame.draw.rect(screen, grid_color[:3], cell_rect, 1)
+                            
+                            # Format the values to 1 decimal place
+                            risk_str = f"R:{cell_data.risk:.1f}"
+                            time_str = f"T:{cell_data.time:.1f}"
+                            fuel_str = f"F:{cell_data.fuel:.1f}"
+                            
+                            # Draw each value on a separate line with dynamic color
+                            # Define ranges for coloring: lower is better (Greener)
+                            risk_color = get_value_color(cell_data.risk, 0.0, 10.0)
+                            time_color = get_value_color(cell_data.time, 1.0, 10.0)
+                            fuel_color = get_value_color(cell_data.fuel, 1.0, 5.0)
+                            
+                            y_offset = 3
+                            # Risk
+                            risk_text = font_cell.render(risk_str, True, risk_color)
+                            screen.blit(risk_text, (cell_x + 2, cell_y + y_offset))
+                            y_offset += 14
+                            
+                            # Time
+                            time_text = font_cell.render(time_str, True, time_color)
+                            screen.blit(time_text, (cell_x + 2, cell_y + y_offset))
+                            y_offset += 14
+                            
+                            # Fuel
+                            fuel_text = font_cell.render(fuel_str, True, fuel_color)
+                            screen.blit(fuel_text, (cell_x + 2, cell_y + y_offset))
         
         # Display ship name in top left (drawn on top of grid)
         if confirmed_ship:
