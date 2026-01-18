@@ -2,6 +2,7 @@ import pygame
 import sys
 import time
 from openpyxl import load_workbook
+from routing import Label
 
 # Initialize Pygame
 pygame.init()
@@ -133,6 +134,8 @@ page2_start_time = None  # Track when page 2 was entered
 point_a = None  # Store point A position
 point_b = None  # Store point B position
 points_confirmed = False  # Track if points A and B have been confirmed
+toggle_on = False  # Toggle button state
+grid_cells = None  # 2D grid of Label instances for each grid square
 
 # Font setup
 font_large = pygame.font.Font(None, 36)
@@ -247,6 +250,19 @@ while running:
     for event in pygame.event.get():
         if event.type == pygame.QUIT:
             running = False
+        elif event.type == pygame.KEYDOWN:
+            if event.key == pygame.K_r:
+                # Reset all state variables to restart the program
+                selected_ship = None
+                current_page = 1
+                confirmed_ship = None
+                selected_ship_type = None
+                page2_start_time = None
+                point_a = None
+                point_b = None
+                points_confirmed = False
+                toggle_on = False
+                grid_cells = None
         elif event.type == pygame.MOUSEBUTTONDOWN:
             mouse_x, mouse_y = event.pos
             
@@ -269,6 +285,19 @@ while running:
                             selected_ship_type = selected_ship.get('Ship type', 'Unknown') if selected_ship else None
                             current_page = 2
                             page2_start_time = time.time()  # Record when page 2 starts
+                            # Initialize grid cells when entering page 2
+                            grid_spacing = 50
+                            grid_cols = (width + grid_spacing - 1) // grid_spacing
+                            grid_rows = (height + grid_spacing - 1) // grid_spacing
+                            grid_cells = []
+                            for row in range(grid_rows):
+                                grid_row = []
+                                for col in range(grid_cols):
+                                    # Initialize each cell as a Label with default values
+                                    # risk=0, time=0, fuel=0, predecessor=None
+                                    cell_label = Label(risk=0.0, time=0.0, fuel=0.0, predecessor=None)
+                                    grid_row.append(cell_label)
+                                grid_cells.append(grid_row)
                             continue
                     
                     # Check if clicking on a ship button
@@ -287,8 +316,31 @@ while running:
                             break
             
             elif current_page == 2:  # Page 2: Map clicking
-                if not points_confirmed:  # Only allow point changes if not confirmed
-                    if event.button == 1:  # Left click
+                if event.button == 1:  # Left click
+                    # Check if clicking on toggle button (top right)
+                    toggle_button_width = 130
+                    toggle_button_height = 30
+                    toggle_button_x = width - toggle_button_width - 10
+                    toggle_button_y = 10
+                    toggle_button_rect = pygame.Rect(toggle_button_x, toggle_button_y, toggle_button_width, toggle_button_height)
+                    
+                    if toggle_button_rect.collidepoint(mouse_x, mouse_y):
+                        # Toggle the state
+                        toggle_on = not toggle_on
+                        # Initialize grid cells if they don't exist and toggle is being turned on
+                        if toggle_on and grid_cells is None:
+                            grid_spacing = 50
+                            grid_cols = (width + grid_spacing - 1) // grid_spacing
+                            grid_rows = (height + grid_spacing - 1) // grid_spacing
+                            grid_cells = []
+                            for row in range(grid_rows):
+                                grid_row = []
+                                for col in range(grid_cols):
+                                    # Initialize each cell as a Label with default values
+                                    cell_label = Label(risk=0.0, time=0.0, fuel=0.0, predecessor=None)
+                                    grid_row.append(cell_label)
+                                grid_cells.append(grid_row)
+                    elif not points_confirmed:  # Only allow point changes if not confirmed
                         # Check if clicking on confirm button
                         if point_a and point_b:
                             button_width = 150
@@ -308,7 +360,8 @@ while running:
                             # Set point A on map click only if on blue surface
                             if is_blue_surface(mouse_x, mouse_y):
                                 point_a = (mouse_x, mouse_y)
-                    elif event.button == 3:  # Right click - point B
+                elif event.button == 3:  # Right click - point B
+                    if not points_confirmed:  # Only allow point changes if not confirmed
                         # Set point B on map click only if on blue surface
                         if is_blue_surface(mouse_x, mouse_y):
                             point_b = (mouse_x, mouse_y)
@@ -457,11 +510,77 @@ while running:
 
     # Page 2: Next Page
     elif current_page == 2:
-        # Display ship name in top left
+        # Draw grid first (if toggle is on) so UI elements appear on top
+        if toggle_on:
+            grid_spacing = 50  # Grid cell size
+            grid_color = (200, 200, 200, 128)  # Semi-transparent gray
+            
+            # Initialize grid cells if they don't exist
+            if grid_cells is None:
+                grid_cols = (width + grid_spacing - 1) // grid_spacing
+                grid_rows = (height + grid_spacing - 1) // grid_spacing
+                grid_cells = []
+                for row in range(grid_rows):
+                    grid_row = []
+                    for col in range(grid_cols):
+                        # Initialize each cell as a Label with default values
+                        cell_label = Label(risk=0.0, time=0.0, fuel=0.0, predecessor=None)
+                        grid_row.append(cell_label)
+                    grid_cells.append(grid_row)
+            
+            # Draw vertical lines
+            for x in range(0, width, grid_spacing):
+                pygame.draw.line(screen, grid_color[:3], (x, 0), (x, height), 1)
+            
+            # Draw horizontal lines
+            for y in range(0, height, grid_spacing):
+                pygame.draw.line(screen, grid_color[:3], (0, y), (width, y), 1)
+            
+            # Display risk, time, and fuel values in each cell
+            if grid_cells is not None:
+                font_cell = pygame.font.Font(None, 16)  # Font for cell values
+                for row in range(len(grid_cells)):
+                    for col in range(len(grid_cells[row])):
+                        cell_label = grid_cells[row][col]
+                        cell_x = col * grid_spacing
+                        cell_y = row * grid_spacing
+                        
+                        # Format the values to 2 decimal places
+                        risk_str = f"R:{cell_label.risk:.2f}"
+                        time_str = f"T:{cell_label.time:.2f}"
+                        fuel_str = f"F:{cell_label.fuel:.2f}"
+                        
+                        # Draw each value on a separate line
+                        y_offset = 3
+                        for text in [risk_str, time_str, fuel_str]:
+                            text_surface = font_cell.render(text, True, BLACK)
+                            screen.blit(text_surface, (cell_x + 2, cell_y + y_offset))
+                            y_offset += 14  # Line spacing
+        
+        # Display ship name in top left (drawn on top of grid)
         if confirmed_ship:
             ship_name = confirmed_ship.get('Ship name', 'Unknown Ship')
             ship_name_text = font_large.render(ship_name, True, BLACK)
             screen.blit(ship_name_text, (10, 10))
+        
+        # Draw toggle button in top right (drawn on top of grid)
+        toggle_button_width = 130
+        toggle_button_height = 30
+        toggle_button_x = width - toggle_button_width - 10
+        toggle_button_y = 10
+        toggle_button_rect = pygame.Rect(toggle_button_x, toggle_button_y, toggle_button_width, toggle_button_height)
+        
+        # Draw button with different color based on state
+        if toggle_on:
+            pygame.draw.rect(screen, GREEN, toggle_button_rect)
+        else:
+            pygame.draw.rect(screen, GRAY, toggle_button_rect)
+        pygame.draw.rect(screen, BLACK, toggle_button_rect, 2)
+        
+        # Draw button text
+        toggle_text = font_small.render("Show Grid", True, BLACK)
+        text_rect = toggle_text.get_rect(center=toggle_button_rect.center)
+        screen.blit(toggle_text, text_rect)
         
         # Display prompt for 3 seconds
         if page2_start_time is not None:
